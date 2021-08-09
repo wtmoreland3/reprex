@@ -1,0 +1,224 @@
+``` r
+## 1.0 Setup ----
+## * 1.1 Load Packages ----
+# Load core packages
+library(tidyverse)
+library(tidymodels)
+#> Registered S3 method overwritten by 'tune':
+#>   method                   from   
+#>   required_pkgs.model_spec parsnip
+library(recipes)
+
+# Load Date/Time Series Packages
+library(lubridate)
+#> 
+#> Attaching package: 'lubridate'
+#> The following objects are masked from 'package:base':
+#> 
+#>     date, intersect, setdiff, union
+library(timetk)
+library(modeltime)
+library(modeltime.ensemble)
+#> Loading required package: modeltime.resample
+library(modeltime.resample)
+
+## * 1.2 Create Test Data for Reprex ----
+
+raw_data_set <- m4_monthly %>%
+  filter(id == "M1" & date >= "2005-01-01")
+
+## 2.0 Data Prep ----
+## * 2.1 Train/Test ----
+splits <- time_series_split(raw_data_set, assess = "12 months", cumulative = TRUE)
+#> Using date_var: date
+
+# * 2.2 Recipe Specification ----
+recipe_spec <- recipe(value ~ ., data = training(splits)) %>%
+  step_timeseries_signature(date) %>%
+  step_rm(matches("(.xts$)|(.iso$)|(.lbl$)|(hour)|(minute)|(second)|(am.pm)|(day)|(week)")) %>%
+  update_role(id, new_role = "indicator") %>%
+  step_normalize(date_index.num, date_year)
+
+# 3.0 Model Prep ----
+# * 3.1 PROPHET ----
+wflw_fit_prophet <- workflow() %>%
+  add_model(
+    spec = prophet_reg() %>% set_engine("prophet")
+  ) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(splits))
+#> Disabling weekly seasonality. Run prophet with weekly.seasonality=TRUE to override this.
+#> Disabling daily seasonality. Run prophet with daily.seasonality=TRUE to override this.
+
+# * 3.2 XGBOOST ----
+wflw_fit_xgboost <- workflow() %>%
+  add_model(
+    spec = boost_tree(mode = "regression") %>% set_engine("xgboost")
+  ) %>%
+  add_recipe(recipe_spec %>% update_role(date, new_role = "indicator")) %>%
+  fit(training(splits))
+
+# * 3.3 ARIMA Workflow ----
+wflw_fit_arima <- workflow() %>%
+  add_model(
+    spec = arima_reg() %>% set_engine("auto_arima")
+  ) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(splits))
+#> frequency = 12 observations per 1 year
+
+# * 3.4 ARIMA Parsnip Obj ----
+model_fit_arima <- arima_reg() %>%
+  set_engine("auto_arima") %>%
+  fit(
+    value ~ date, 
+    data = training(splits)
+  )
+#> frequency = 12 observations per 1 year
+
+# * 3.5 LINEAR REGRESSION Parsnip Obj ----
+model_fit_lm <- linear_reg() %>%
+  set_engine("lm") %>%
+  fit(
+    value ~ as.numeric(date) + month(date, label = TRUE), 
+    data = training(splits)
+  )
+
+# * 3.6 ETS ----
+model_fit_ets <- exp_smoothing() %>%
+  set_engine("ets") %>%
+  fit(
+    value ~ date + as.numeric(date) + month(date, label = TRUE), 
+    data = training(splits)
+  )
+#> frequency = 12 observations per 1 year
+
+## 4.0 Model Evaluation ----
+# * 4.1 Accuracy Check ----
+submodels_tbl <- modeltime_table(
+  wflw_fit_prophet,
+  wflw_fit_xgboost,
+  wflw_fit_arima,
+  model_fit_arima,
+  model_fit_lm,
+  model_fit_ets
+)
+
+# * 4.2 Calibration -----
+calibration_tbl <- submodels_tbl %>%
+  modeltime_calibrate(testing(splits))
+
+# Test Accuracy Table
+calibration_tbl %>%
+  modeltime_accuracy() %>%
+  arrange(mape)
+#> # A tibble: 6 x 9
+#>   .model_id .model_desc                .type   mae  mape  mase smape  rmse   rsq
+#>       <int> <chr>                      <chr> <dbl> <dbl> <dbl> <dbl> <dbl> <dbl>
+#> 1         6 ETS(M,AD,M)                Test   399.  6.58 0.520  6.45  427. 0.901
+#> 2         4 ARIMA(0,1,0)(0,1,1)[12]    Test   495.  8.09 0.645  8.72  656. 0.870
+#> 3         3 REGRESSION WITH ARIMA(1,0~ Test   569.  9.25 0.742  9.09  693. 0.717
+#> 4         1 PROPHET W/ REGRESSORS      Test   792. 13.2  1.03  12.1   897. 0.901
+#> 5         2 XGBOOST                    Test   949. 15.9  1.24  14.8  1083. 0.568
+#> 6         5 LM                         Test  4124. 69.6  5.37  51.1  4154. 0.849
+
+# 5.0 RESAMPLING / CROSS-VALIDATION ----
+# * 5.1 Resampling Plan ----
+resamples_tscv <- training(splits) %>%
+  time_series_cv(
+    assess      = 12,
+    skip        = 12,
+    cumulative  = TRUE, 
+    slice_limit = 3
+  )
+#> Using date_var: date
+
+# * 5.2 Fitting Resamples ----
+model_tbl_tuned_resamples <- submodels_tbl %>%
+  modeltime_fit_resamples(
+    resamples = resamples_tscv,
+    control   = control_resamples(verbose = TRUE, allow_par = TRUE)
+  )
+#> -- Fitting Resamples --------------------------------------------
+#> * Model ID: 1 PROPHET W/ REGRESSORS
+#> i Slice1: preprocessor 1/1
+#> v Slice1: preprocessor 1/1
+#> i Slice1: preprocessor 1/1, model 1/1
+#> Disabling weekly seasonality. Run prophet with weekly.seasonality=TRUE to override this.
+#> Disabling daily seasonality. Run prophet with daily.seasonality=TRUE to override this.
+#> v Slice1: preprocessor 1/1, model 1/1
+#> i Slice1: preprocessor 1/1, model 1/1 (predictions)
+#> i Slice2: preprocessor 1/1
+#> v Slice2: preprocessor 1/1
+#> i Slice2: preprocessor 1/1, model 1/1
+#> Disabling weekly seasonality. Run prophet with weekly.seasonality=TRUE to override this.
+#> Disabling daily seasonality. Run prophet with daily.seasonality=TRUE to override this.
+#> v Slice2: preprocessor 1/1, model 1/1
+#> i Slice2: preprocessor 1/1, model 1/1 (predictions)
+#> i Slice3: preprocessor 1/1
+#> v Slice3: preprocessor 1/1
+#> i Slice3: preprocessor 1/1, model 1/1
+#> Disabling weekly seasonality. Run prophet with weekly.seasonality=TRUE to override this.
+#> Disabling daily seasonality. Run prophet with daily.seasonality=TRUE to override this.
+#> v Slice3: preprocessor 1/1, model 1/1
+#> i Slice3: preprocessor 1/1, model 1/1 (predictions)
+#> * Model ID: 2 XGBOOST
+#> i Slice1: preprocessor 1/1
+#> v Slice1: preprocessor 1/1
+#> i Slice1: preprocessor 1/1, model 1/1
+#> v Slice1: preprocessor 1/1, model 1/1
+#> i Slice1: preprocessor 1/1, model 1/1 (predictions)
+#> i Slice2: preprocessor 1/1
+#> v Slice2: preprocessor 1/1
+#> i Slice2: preprocessor 1/1, model 1/1
+#> v Slice2: preprocessor 1/1, model 1/1
+#> i Slice2: preprocessor 1/1, model 1/1 (predictions)
+#> i Slice3: preprocessor 1/1
+#> v Slice3: preprocessor 1/1
+#> i Slice3: preprocessor 1/1, model 1/1
+#> v Slice3: preprocessor 1/1, model 1/1
+#> i Slice3: preprocessor 1/1, model 1/1 (predictions)
+#> * Model ID: 3 REGRESSION WITH ARIMA(1,0,2)(2,0,0)[12] ERRORS
+#> i Slice1: preprocessor 1/1
+#> v Slice1: preprocessor 1/1
+#> i Slice1: preprocessor 1/1, model 1/1
+#> frequency = 12 observations per 1 year
+#> v Slice1: preprocessor 1/1, model 1/1
+#> i Slice1: preprocessor 1/1, model 1/1 (predictions)
+#> i Slice2: preprocessor 1/1
+#> v Slice2: preprocessor 1/1
+#> i Slice2: preprocessor 1/1, model 1/1
+#> frequency = 12 observations per 1 year
+#> v Slice2: preprocessor 1/1, model 1/1
+#> i Slice2: preprocessor 1/1, model 1/1 (predictions)
+#> i Slice3: preprocessor 1/1
+#> v Slice3: preprocessor 1/1
+#> i Slice3: preprocessor 1/1, model 1/1
+#> frequency = 12 observations per 1 year
+#> v Slice3: preprocessor 1/1, model 1/1
+#> i Slice3: preprocessor 1/1, model 1/1 (predictions)
+#> * Model ID: 4 ARIMA(0,1,0)(0,1,1)[12]
+#> i Slice1: preprocessor 1/1
+#> v Slice1: preprocessor 1/1
+#> i Slice1: preprocessor 1/1, model 1/1
+#> frequency = 12 observations per 1 year
+#> v Slice1: preprocessor 1/1, model 1/1
+#> i Slice1: preprocessor 1/1, model 1/1 (predictions)
+#> i Slice2: preprocessor 1/1
+#> v Slice2: preprocessor 1/1
+#> i Slice2: preprocessor 1/1, model 1/1
+#> frequency = 12 observations per 1 year
+#> v Slice2: preprocessor 1/1, model 1/1
+#> i Slice2: preprocessor 1/1, model 1/1 (predictions)
+#> i Slice3: preprocessor 1/1
+#> v Slice3: preprocessor 1/1
+#> i Slice3: preprocessor 1/1, model 1/1
+#> frequency = 12 observations per 1 year
+#> v Slice3: preprocessor 1/1, model 1/1
+#> i Slice3: preprocessor 1/1, model 1/1 (predictions)
+#> * Model ID: 5 LM
+#> Error: No in-line functions should be used here; use steps to define baking actions.
+#> * Model ID: 6 ETS(M,AD,M)
+#> Error: No in-line functions should be used here; use steps to define baking actions.
+#> 84.59 sec elapsed
+```
